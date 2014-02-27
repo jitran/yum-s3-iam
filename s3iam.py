@@ -27,12 +27,15 @@ import time
 import hashlib
 import hmac
 import json
+import sys
+import ConfigParser
 
 import yum
 import yum.config
 import yum.Errors
 import yum.plugins
 
+from os.path import expanduser
 from yum.yumRepo import YumRepository
 
 
@@ -120,6 +123,10 @@ class S3Grabber(object):
 
     def get_role(self):
         """Read IAM role from AWS metadata store."""
+        # Skip retrieval of iam role if awscli credentials exists
+        if self.get_awscli_credentials():
+            return
+
         request = urllib2.Request(
             urlparse.urljoin(
                 "http://169.254.169.254",
@@ -130,15 +137,45 @@ class S3Grabber(object):
         try:
             response = urllib2.urlopen(request)
             self.iamrole = (response.read())
+        except:
+            print "Error: Access to S3 Yum Repo via IAM Role Denied"
+            sys.exit(1)
         finally:
             if response:
                 response.close()
 
+    def get_home_path(self):
+        return expanduser("~")
+
+    def get_awscli_credentials(self):
+        try:
+            config = ConfigParser.ConfigParser()
+            config.read("%s/.aws/config" % self.get_home_path())
+            self.access_key = config.get("default", "aws_access_key_id")
+            self.secret_key = config.get("default", "aws_secret_access_key")
+            self.token = None
+            if self.access_key and self.secret_key:
+                return True
+        except:
+            pass
+        return False
+
+    """
+    Expected flow:
+        1) If you have awscli keys it will use that first
+            Note: This assumes the keys are correct and if authorisation fails, you'll get an error
+        2) If there are no keys, it will default to iam roles
+            Note: If the iam role doesn't have access to the s3 bucket, it'll skip the s3yum repo
+    """
     def get_credentials(self):
         """Read IAM credentials from AWS metadata store.
         Note: This method should be explicitly called after constructing new
               object, as in 'explicit is better than implicit'.
         """
+        # # Skip retrieval of iam role based credentials if awscli credentials exists
+        if self.get_awscli_credentials():
+            return
+
         request = urllib2.Request(
             urlparse.urljoin(
                 urlparse.urljoin(
@@ -161,7 +198,8 @@ class S3Grabber(object):
     def _request(self, path):
         url = urlparse.urljoin(self.baseurl, urllib2.quote(path))
         request = urllib2.Request(url)
-        request.add_header('x-amz-security-token', self.token)
+        if self.token is not None:
+            request.add_header('x-amz-security-token', self.token)
         signature = self.sign(request)
         request.add_header('Authorization', "AWS {0}:{1}".format(
             self.access_key,
@@ -184,6 +222,8 @@ class S3Grabber(object):
             while buff:
                 out.write(buff)
                 buff = response.read(8192)
+        except:
+            print "Error: Access to S3 Yum Repo Denied"
         finally:
             if response:
                 response.close()
@@ -221,13 +261,21 @@ class S3Grabber(object):
                 "found '%s'" % host)
 
         resource = "/%s%s" % (bucket, request.get_selector(), )
-        amz_headers = 'x-amz-security-token:%s\n' % self.token
-        sigstring = ("%(method)s\n\n\n%(date)s\n"
-                     "%(canon_amzn_headers)s%(canon_amzn_resource)s") % ({
-                         'method': request.get_method(),
-                         'date': request.headers.get('Date'),
-                         'canon_amzn_headers': amz_headers,
-                         'canon_amzn_resource': resource})
+        if self.token is not None:
+            amz_headers = 'x-amz-security-token:%s\n' % self.token
+            sigstring = ("%(method)s\n\n\n%(date)s\n"
+                         "%(canon_amzn_headers)s"
+                         "%(canon_amzn_resource)s") % ({
+                'method': request.get_method(),
+                'date': request.headers.get('Date'),
+                'canon_amzn_headers': amz_headers,
+                'canon_amzn_resource': resource})
+        else:
+            sigstring = ("%(method)s\n\n\n%(date)s\n"
+                         "%(canon_amzn_resource)s") % ({
+                'method': request.get_method(),
+                'date': request.headers.get('Date'),
+                'canon_amzn_resource': resource})
         digest = hmac.new(
             str(self.secret_key),
             str(sigstring),
